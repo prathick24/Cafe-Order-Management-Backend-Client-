@@ -1,0 +1,351 @@
+@startuml mcp_client_sequence
+!theme plain
+skinparam sequenceMessageAlign center
+skinparam maxMessageSize 200
+skinparam noteBackgroundColor lightyellow
+skinparam noteTextColor black
+title POST: Bean & Brew Coffee Shop - MCP Client
+autonumber 1.0
+actor Client
+participant "src/\nmain.py" as MAIN
+participant "src/routes/\norder_agent_route.py" as Router
+participant "src/models/\nmodel.py" as Model
+participant "src/services/\norder_agent_service.py" as Service
+participant "src/agents/\nagent.py" as Agent
+participant "MCP Server\nhttp://localhost:8000/mcp" as MCPServer
+participant "src/repositories/\norder_agent_repository.py" as Repository
+participant "src/repositories/\ndatabase.py" as Database
+participant "src/repositories/schemas/\nschema.py" as Schema
+participant "src/utils/exceptions/\ncustom_app_exception.py" as CustomAppException
+participant "src/utils/\nerrorlog.py" as Errorlog
+
+' === NOTES ===
+note over MAIN
+    **IMPORTS**
+    Import FastAPI for creating application instance
+    from fastapi.responses import JSONResponse to create custom JSONResponses
+    import Router from src/routes/order_agent_route to direct incoming requests
+    import CustomAppException to raise exceptions specific to the business
+    import ErrorCode, ErrorCodeStatus to get the specific error codes
+    Register @exception_handler(CustomAppException) to handle structured error responses
+    Register @exception_handler(RequestValidationError) to handle validation errors
+end note
+
+note over Router
+    from fastapi import APIRouter, Body to create API routes and read request body data
+    import JSONResponse from fastapi.responses to send JSON formatted response to client
+    import APIResponse Model to standardise all responses to this format
+    import AgentService from services to pass extracted user query to the service layer
+    import error_log from utils.errorlog to log errors to the database
+    import CustomAppException to raise any application specific errors
+    import UserRequestDTO from models to validate the request sent by the user
+end note
+
+note over Service
+    import CustomAppException to raise structured exceptions
+    import ErrorCodes to set appropriate error codes in error responses
+    import HttpStatusCode to ensure response status codes
+    import OrderAgent from agents.agent to invoke the LLM agent
+    import error_log from utils.errorlog to log errors to the database
+end note
+
+note over Agent
+    import Config from utils.config to get LLM instance
+    import create_react_agent from langgraph.prebuilt
+    import MultiServerMCPClient from langchain_mcp_adapters.client
+    import CustomAppException for structured error handling
+    import error_log from utils.errorlog to log errors to the database
+end note
+
+note over CustomAppException
+    **Custom Exception Imports**
+    importing APIResponse and Error to define the
+    unified success and error structures returned by the API
+end note
+
+' === MAIN ===
+group MAIN
+    activate MAIN
+
+    note over Client
+        User hits http://localhost:8080/training/api/v1/order_agent
+        **request_body**:
+        {
+            "user_query": "I would like to have two coffees"
+        }
+    end note
+
+    Client -> MAIN : Client sends the request to the application
+    MAIN -> MAIN : FastAPI app instance created with title "Order Agent API"
+    MAIN -> MAIN : CORSMiddleware configured to allow all origins, methods and headers
+    MAIN -> MAIN : order_agent_route router included in the application
+    MAIN -> MAIN : @exception_handler(CustomAppException) registered\nto handle structured error responses
+    MAIN -> Router : matches and forwards the request to the "/training/api/v1/order_agent" endpoint
+
+    ' === ROUTER ===
+    activate Router
+    group Router Try
+        Router -> Router : variable router assigns APIRouter object with prefix "/training/api" and tags ["Cart", "Product"]
+        Router -> Router : Router maps the API endpoint to agent_route() based on POST /v1/order_agent
+        Router -> Model : checks the request body with Pydantic validations
+        activate Model
+        alt Validation success
+            Model -> Model : user_query validated — checks type=str, value non-empty
+            Model --> Router : UserRequestDTO instance returned, user_query validated successfully
+            deactivate Model
+        else Validation failed
+            Model -> Model : Pydantic raises RequestValidationError — field-level error list describing every invalid field
+            Model --> Router : RequestValidationError returned — missing or wrong type fields described
+            deactivate Model
+            Router --> MAIN : RequestValidationError forwarded to main
+            MAIN -> MAIN : triggers @exception_handler(RequestValidationError) to structure the response format
+            MAIN --> Client : JSONResponse(status_code=422, content={"detail": validation errors}) returned
+            note over Client
+                HTTP 422 — Validation Failed:
+                {
+                    "detail": [
+                        {
+                            "loc": ["body", "user_query"],
+                            "msg": "field required",
+                            "type": "value_error.missing"
+                        }
+                    ]
+                }
+            end note
+        end
+
+        Router -> Router : Routes the request to the desired service layer to perform business logic
+        Router -> Router : variable service creates object for AgentService class
+        Router -> Service : request passes to AgentService().agent_service(user_query)
+
+        ' === SERVICE ===
+        group Service Try
+            activate Service
+            Service -> Service : OrderAgent instance created and stored in self.agent
+            Service -> Agent : await self.agent.create_agent(user_query) triggered
+
+            ' === AGENT ===
+            group Agent Try
+                activate Agent
+                Agent -> Agent : MCP_SERVER_URL assigned "http://localhost:8000/mcp"
+                Agent -> Agent : Variable Prompt_agrs store all the prompt details with description
+                Agent -> Agent : variable ecoded_password uses quote_plus which will encode our db password
+                Agent -> Agent : Build the DB URI and store it in variable DB_URI
+                
+                Agent -> Agent : llm instance created via configure.get_llm() with max_tokens=500, temperature=0
+
+                Agent -> Agent : MultiServerMCPClient initialized with transport="streamable_http" url=MCP_SERVER_URL
+
+                note over Agent, MCPServer
+                    client = MultiServerMCPClient(
+                    {
+                        "day5-tools": {
+                            "transport": "streamable_http",
+                            "url": "http://localhost:8000/mcp"
+                        }
+                    })
+                end note
+                Agent -> MCPServer : create an async session to share the same session across tools,resources and prompts
+                Agent -> MCPServer : variable tools assign await load_mcp_tool(session) to fetch all registered MCP tools
+                activate MCPServer
+                MCPServer -> MCPServer : get_status and place_order tools retrieved from MCP server registry
+                MCPServer --> Agent : variable tools is assigned with the tools from server
+                Agent -> MCPServer : variable blobs assign await load_mcp_resources(session) to retrive all resoures from server registry
+                MCPServer -> MCPServer : get_menu resource is retrived from MCP server registry
+                MCPServer --> Agent : variable blobs is assigned with as many resources that are listed
+                Agent -> Agent : variable resource_context is created to store the all the resources content
+                Agent -> Agent : Loop through the blobs variable to get context of all resources
+                Agent -> Agent : blob.as_bytes().decode("utf-8") will extract the content from each resource and stored in variable text
+                Agent -> Agent : variable uri stores the uri of the particular resource
+                Agent -> Agent : In resource_context varible , the uri and text are appended
+                Agent -> MCPServer : Variable list_result assign await session.list_prompts() 
+                MCPServer --> Agent: The above will list all the prompts availble in the server
+                Agent -> Agent : variable available_prompt is created to extract and store the prompts feild from list_result
+                Agent -> Agent : A list named prompt_messages is created to extract the prompt content and store it
+                Agent -> Agent : Loop through the prompt list and get its agr by using prompt.name
+                Agent -> MCPServer : variable messages assign await load_mcp_prompts(session , prompt.name , arguments)
+                MCPServer --> Agent : The above will load the prompt with the particular name mentioned in parameter
+                Agent -> Agent : The message is appened to prompt_messages list 
+                Agent -> Agent : The same will repeat for all prompts in the server
+                Agent -> Agent : varible messages will store list(prompt_messages) just a copy for best practice
+                Agent -> Agent : If resource_content is not none , the resource content is append to messages list
+                Agent -> Agent : Create a async session using AsyncPostgrsSaver to talk to the database as checkpointer
+                Agent -> Agent : variable summarizer uses class SummarizationMiddleware to create middleware that will summarize the convo
+                note over Agent
+                     summarizer = SummarizationMiddleware(
+                                model=Config.get_llm(self ,max_tokens=150, temperature=0.2), 
+                                trigger=("tokens", 300),      
+                                keep=("messages", 4),          
+                                summary_prompt="""
+                                        Summarize the conversation clearly and concisely.
+                                        IMPORTANT: Always preserve:
+                                        - User name
+                                        - User job/domain
+                                        - Key preferences or tools used
+                                    """
+                                )
+                end note
+                Agent -> Agent : Variable confirm order is assigned with HumanInTheLoop middleware which will pause the tool function and ask for confirmation
+                note over Agent
+                confirm_order = HumanInTheLoopMiddleware(
+                        interrupt_on={"place_order" : True}
+                    )
+                end note
+                Agent -> Agent : variable agent assigned with create_agent initialized with model=llm, tools=tools, prompt=SYSTEM_PROMPT, middleware=[summarizer],checkpointer=checkpointer,  
+                Agent -> Agent : variable runconfig creates RunnableConfig which helps in configuring the thread_id with the same customer
+                Agent -> MCPServer :variable result assign await agent.ainvoke called with user_query as message content
+                 
+
+                note over Agent, MCPServer
+                    agent.ainvoke({
+                        "messages": [
+                            {"role": "user", "content": "I would like to have two coffees"}
+                        ]
+                    })
+                end note
+
+                MCPServer -> MCPServer : LLM processes user_query with SYSTEM_PROMPT context
+                alt interrupt
+                    MCPServer -> MCPServer : Based on user_query, LLM routes to tool on MCP server 
+                    MCPServer --> Agent : If the tool chosen by agent has HITL enabled , interrupt will pause the execution
+                    Agent -> Agent : a Loop will run until the user input is whether yes or no
+                    Agent -> Agent : variable decision is created to store the user decision
+                    Agent -> MCPServer : variable final_result invoked to resume the paused function to get the response
+                    MCPServer -> Agent : finally finalt_result["messages"[-1].content is resturned
+                else
+
+                    Agent -> Agent : LLM generates final user-friendly response with order details and order_id
+                    Agent -> Agent : variable final assigned result["messages"][-1].content
+                    Agent --> Service : final response string returned
+                deactivate MCPServer
+            end
+            
+            group Agent Exception
+                group Error_log
+                    Agent -> Errorlog : error_log("agent.py", "create_agent", e) called with filename, function_name, error details
+                    activate Errorlog
+                    Errorlog -> Errorlog : AgentRepository instance created inside error_log
+                    Errorlog -> Repository : await repo.create_errorlog (filename, function_name, error_message) called
+                    activate Repository
+                    Repository -> Repository : Session created for database communication
+                    Repository -> Database : db_session assigned via self.db_instance.SessionLocal()
+                    activate Database
+                    group Database
+                        Database -> Database : Creates session factory bound to shared engine instance
+                        Database --> Repository : Connection successful, session object returned
+                    end
+                    activate Schema
+                    Repository -> Schema : new_error = Errorlog( filename, function_name, error_message)
+                    Schema --> Repository : Errorlog instance returned
+                    deactivate Schema
+                    Repository -> Database : db_session.add(new_error)
+                    note over Repository, Database
+                        **ORM OPERATION: INSERT ERRORLOG**
+                        db_session.add(new_error)
+                        db_session.flush()
+                        db_session.commit()
+                    end note
+                    Repository -> Database : db_session.flush()
+                    Repository -> Database : db_session.commit()
+                    Repository -> Database : db_session.close()
+                    deactivate Database
+                    Repository -> Repository : variable error_log_id assigned new_error.error_log_id
+                    Repository --> Errorlog : error_log_id returned
+                    deactivate Repository
+                    Errorlog --> Agent : flow returns to Agent layer
+                    deactivate Errorlog
+                end
+                Agent -> CustomAppException : CustomAppException raised with message "Error in create llm or invoke agent", code=INTERNAL_SERVER_ERROR,\nstatus_code=SERVICE_UNAVAILABLE
+                activate CustomAppException
+                CustomAppException --> Agent : CustomAppException(503) built and returned
+                deactivate CustomAppException
+                Agent --> Service : CustomAppException(503) forwarded to Service
+                deactivate Agent
+            end
+            ' === END AGENT EXCEPT ===
+
+            Service -> Service : variable result stores\nresponse returned from agent
+            Service --> Router : result sent back to Router
+        end
+        ' === SERVICE EXCEPT ===
+        group Service Exception
+            group Error_log
+                Service -> Errorlog : error_log("service.py", "agent_service", e) called\nwith filename, function_name, error details
+                activate Errorlog
+                Errorlog -> Errorlog : AgentRepository instance created inside error_log
+                Errorlog -> Repository : await repo.create_errorlog\n(filename, function_name, error_message) called
+                activate Repository
+                Repository -> Database : Refer Database group above
+                activate Database
+                Database --> Repository : session returned
+                deactivate Database
+                activate Schema
+                Repository -> Schema : new_error = Errorlog(\nfilename, function_name, error_message)
+                Schema --> Repository : Errorlog instance returned
+                deactivate Schema
+                Repository -> Database : db_session.add(new_error)\ndb_session.flush() db_session.commit() db_session.close()
+                Repository --> Errorlog : error_log_id returned
+                deactivate Repository
+                Errorlog --> Service : flow returns to Service layer
+                deactivate Errorlog
+            end
+            Service -> CustomAppException : CustomAppException raised with message "Database error creating errorlog", code=DATABASE_ERROR, status_code=INTERNAL_SERVER_ERROR
+            activate CustomAppException
+            CustomAppException --> Service : CustomAppException(500) built and returned
+            deactivate CustomAppException
+            Service --> Router : CustomAppException(500) forwarded to Router
+            deactivate Service
+        end
+        ' === END SERVICE EXCEPT ===
+
+        Router -> Router : wraps the response with JSONResponse and APIResponse
+        Router --> MAIN : sends JSON response to main layer
+    end
+    ' === ROUTER EXCEPT ===
+    group Router Exception
+        group Error_log
+            Router -> Errorlog : error_log("route.py", "agent_route", e) called with filename, function_name, error details
+            activate Errorlog
+            Errorlog -> Errorlog : AgentRepository instance created inside error_log
+            Errorlog -> Repository : await repo.create_errorlog (filename, function_name, error_message) called
+            activate Repository
+            Repository -> Database : Refer Database group above
+            activate Database
+            Database --> Repository : session returned
+            deactivate Database
+            activate Schema
+            Repository -> Schema : new_error = Errorlog( filename, function_name, error_message)
+            Schema --> Repository : Errorlog instance returned
+            deactivate Schema
+            Repository -> Database : db_session.add(new_error) db_session.flush() db_session.commit() db_session.close()
+            Repository --> Errorlog : error_log_id returned
+            deactivate Repository
+            Errorlog --> Router : flow returns to Router layer
+            deactivate Errorlog
+        end
+        Router -> CustomAppException : CustomAppException raised with message "Router error in processing user query", code=INTERNAL_SERVER_ERROR, status_code=INTERNAL_SERVER_ERROR
+        activate CustomAppException
+        CustomAppException --> Router : CustomAppException(500) built and returned
+        deactivate CustomAppException
+        Router --> MAIN : CustomAppException(500) forwarded to main layer
+        deactivate Router
+    end
+    ' === END ROUTER EXCEPT ===
+
+    MAIN -> MAIN : triggers @exception_handler(CustomAppException) to structure the error response format
+    MAIN --> Client : displays the final response to the user
+
+    note over Client
+        **Sample success response sent to the client**
+        {
+            "data": "Order placed successfully! Your order id is 2 ☕",
+            "errors": [],
+            "status_code": 200,
+            "message": "Success"
+        }
+    end note
+
+    deactivate MAIN
+end
+
+@enduml
