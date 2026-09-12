@@ -1,0 +1,339 @@
+@startuml mcp_server_sequence
+!theme plain
+skinparam sequenceMessageAlign center
+skinparam maxMessageSize 200
+skinparam noteBackgroundColor lightyellow
+skinparam noteTextColor black
+title POST: Bean & Brew Coffee Shop - MCP Server
+autonumber 1.0
+
+actor Client
+participant "src/\n main.py" as Main
+participant "src/routes/\n agent_route.py" as Router
+participant "src/resources/\nresource.py" as Resource
+participant "src/prompts/\n prompt.py" as Prompt
+participant "src/tools/\ntools.py" as Tool
+participant "src/repositories/\nagent_repository.py" as Repository
+participant "src/repositories/\ndatabase.py" as Database
+participant "src/repositories/\nschema.py" as Schema
+participant "src/utils/\nerror_log.py" as Errorlog
+
+' === IMPORT NOTES ===
+
+note over Main
+    **IMPORTS**
+    from fastmcp import FastMCP to build server
+    from routes.order_agent_route import router to access router
+end note
+
+note over Router
+    from fastmcp import FastMCP 
+    import tools.tool to register the tools
+    import resources.resource to register resources
+    import prompts.prompt to register prompts
+end note
+
+note over Repository
+    **Repository Imports**
+    import Session manages database transactions and ORM operations within SQLAlchemy.
+    from database.order_database import Database to create a object for it and use its methods
+    import CustomAppException captures application-specific errors with structured details.
+    import errorcodes for getting error specific code and its status
+    import HttpStatusCode centralizes HTTP status codes for consistent responses.
+end note
+
+note over Tool
+    import the MenuRepository class from the repositories.menu_repository
+    import CustomAppException captures application-specific errors with structured details.
+    import errorcodes for getting error specific code and its status
+    import HttpStatusCode centralizes HTTP status codes for consistent responses.
+end note
+note over Resource
+    import tool decorator from langchain_core.tools
+    import the MenuRepository class from the repositories.menu_repository
+end note
+note over Prompt
+    from routes.order_agent_route import router for using @router decorator
+end note
+
+
+
+' === CLIENT REQUEST ===
+
+note over Client
+    client calls the http://localhost:8080/mcp to access the mcp server
+end note
+
+Client -> Main : client sends the request to the application\nand creates a stateless session with server.
+
+autonumber 1.0
+
+' === MAIN ===
+
+group (Main)
+    activate Main
+    Main -> Main : Imports FastMCP to create an MCP server and imports the router that defines agent routes.
+    Main -> Main : Mounts the order agent router so its tools\nbecome available on the MCP server.
+    Main -> Router : The flow goes to the router
+
+    autonumber 2.0
+
+    ' === ROUTER ===
+
+    group (Router)
+        activate Router
+        Router -> Router : Imports FastMCP to create an MCP router that can expose tools and handlers.
+        Router -> Router : Creates an MCP router instance named "router" to logically group related tools.
+        Router -> Router : Imports tools.tool, which automatically registers tools with the router.
+        Router -> Router : Imports resources.resource, which automatically registers Resources with the router.
+        Router -> Router : Imports prompts,prompt, which automatically registers prompts with the router.
+
+        Router -> Resource : The flow goes to the resource layer
+
+        autonumber 3.0
+
+        group (Resource)
+            activate Resource
+
+            group try(list_menu)
+                Resource -> Resource : @router.Resource decorator makes this function a Resource for the agent
+                Resource -> Resource : For example if the user query is "what are the dishes available here", agent will automatically route to this Resource
+                Resource -> Resource : In this Resource function we access the repo to get the items in database
+                Resource -> Repository : variable menu is assigned with repo.get_menu function
+                activate Repository
+                Repository -> Repository : Before interacting with the database, a session must be created for communication.
+                Repository -> Repository : The session represents the active link between the Repository and the database.
+                Repository -> Database : variable db_session assign self.db_instance.SessionLocal() and we also invoke a method _create_engine() in database that returns database session.
+                activate Database
+
+                autonumber 4.0
+                group (Database)
+                    Database -> Database : Creates an engine which is used to create and manage the actual database connection.
+                    Database -> Database : Controls object creation ensuring only one Database instance exists.
+                    Database -> Database : Creates session factory bound to shared engine instance.
+                    Database -> Database : Validates database connectivity using simple SELECT query execution.
+                    Database --> Repository : connection made successful, session object is returned, connection is made.
+                end
+
+                Repository -> Database : variable menu assign db_session.query(Items.item_name, Items.item_price).all()
+
+                note over Repository, Database
+                    **ORM OPERATION: GET MENU**
+                    db_session.query(Items.item_name, Items.item_price).all()
+                end note
+
+                Database --> Repository : db assigns menu with all items queried for.
+                deactivate Database
+                Repository --> Resource : menu is returned back to Resource for further process
+                deactivate Repository
+                Resource -> Router : Resource is registered to the server
+            end
+
+            group except(list_menu)
+                Resource -> Errorlog : If any error occurs in calling variable menu via repo.get_menu function
+                activate Errorlog
+                Errorlog -> Errorlog : log_error function receives it and we access repo layer directly by creating instance of it here
+                Errorlog -> Errorlog : Payload is created using the parameter received
+                activate Repository
+                Errorlog -> Repository : variable response assigns log_error_in_db function by sending payload as parameter
+                Repository -> Repository : Before interacting with the database, a session must be created for communication.
+                Repository -> Repository : The session represents the active link between the Repository and the database.
+                Repository -> Database : variable db_session assign self.db_instance.SessionLocal() and we also invoke _create_engine() in database that returns database session.
+                activate Database
+                group (Database)
+                    Database -> Repository : Refer 4.0
+                end
+                activate Schema
+                Repository -> Schema : variable error assign Errorlog(filename, functionname, error_message)
+                Schema --> Repository : variable error assigned Errorlog Instance
+                deactivate Schema
+                Repository -> Database : db_session.add(error)
+                note over Repository, Database
+                    **ORM OPERATION: INSERT ERRORLOG**
+                    db_session.add(error)
+                    db_session.commit()
+                    ' SQLAlchemy ORM handles INSERT automatically
+                end note
+                deactivate Database
+                Repository -> Repository : variable errorlog_id assign error.id
+                Repository --> Errorlog : error id is returned back to errorlog
+                deactivate Repository
+                Errorlog --> Resource : Flow goes back to the Resource layer
+                deactivate Errorlog
+
+            end
+
+            group (policy)
+                Resource -> Resource : This resource will helps in answering questions about company policy
+                Resource -> Resource : So this resource will just return the String that contains company policy
+                Resource -> Router : Resource is registered to the server
+            end
+        deactivate Resource
+
+       
+        group (Prompt) 
+        activate Prompt
+            Router -> Prompt :  @router.prompt decorator makes this function a prompt for the agent
+            Prompt -> Prompt : Here the function system prompt will contain system prompt for the LLM Model
+            Prompt -> Prompt : The prompt is returned back to the server
+            Prompt -> Router : Prompt is registered to the server
+        deactivate Prompt
+        end 
+                
+        
+        group (Tools)
+            activate Tool
+            group try(place_order)
+                Tool -> Tool : @tool decorator makes this function a tool for the agent
+                Tool -> Tool : For example if the user query is "order 2 coffee", agent will automatically route to this tool
+                Tool -> Tool : In this tool function we access the repo to insert order in database
+                Tool -> Tool : Agent automatically knows how to replace the parameter with the items user asked for based on the tool description
+                Tool -> Repository : In tool description we will tell Args should be items: List of product name with quantity
+                activate Repository
+
+                == Product ID Retrieval ==
+
+                Repository -> Repository : create a list called productIDs and quantity to store all product ids and required quantity and variable price to store total price
+
+                alt product validation — item found
+                    Repository -> Repository : loop through the items that is converted by agent and fetch every product id using name
+                    Repository -> Repository : variable product assign db_session.query(Items.item_id, Items.item_price) .filter(Items.item_name == str(item_name))
+                    Repository -> Repository : Extract item_id and append in productIds list, from item.quantity append it to update variable price, add item_price * quantity in amount variable
+                else product validation — item not found
+                    Repository -> Repository : if any of the returned product id is none, an error msg is sent back
+                    Repository --> Tool : return "item not available in our menu"
+                    Tool --> Router : flow forwarded to Router
+                    Router --> Client : Client receives the response with the error message
+                end
+
+                == New Order Creation ==
+
+                Repository -> Repository : variable order assigned with repo.place_order(productIDs, quantity, amount)
+                activate Schema
+                Repository -> Schema : variable new_order assign Order(final_price = amount)
+                Schema --> Repository : variable new_order assigned Order Instance
+                deactivate Schema
+                Repository -> Database : db_session.add(new_order)
+                activate Database
+                note over Repository, Database
+                    **ORM OPERATION: INSERT ORDER**
+                    db_session.add(new_order)
+                    db_session.commit()
+                    ' SQLAlchemy ORM handles INSERT automatically
+                end note
+                Repository -> Repository : variable order_id assign new_order.order_id
+                Repository -> Repository : Loop through the List of product IDs and Insert one by one into order_items_table
+                activate Schema
+                Repository -> Schema : variable new_order_items assign order_items_model(order_id, product_id[i], quantity[i])
+                Schema --> Repository : variable new_order_items assigned order_items_model Instance
+                deactivate Schema
+                Repository -> Database : db_session.add(new_order_items)
+                Repository -> Database : db_session.commit()
+                Repository -> Database : db_session.close()
+                deactivate Database
+                Repository --> Tool : return back the order_id to Tool
+                deactivate Repository
+            end
+
+            group except(place_order)
+                Tool -> Errorlog : If any error occurs in place_order tool
+                activate Errorlog
+                Errorlog -> Errorlog : log_error function receives it and we access repo layer directly by creating instance of it here
+                Errorlog -> Errorlog : Payload is created using the parameter received
+                activate Repository
+                Errorlog -> Repository : variable response assigns log_error_in_db function by sending payload as parameter
+                Repository -> Repository : Before interacting with the database, a session must be created for communication.
+                Repository -> Repository : The session represents the active link between the Repository and the database.
+                Repository -> Database : variable db_session assign self.db_instance.SessionLocal() and we also invoke _create_engine() in database that returns database session.
+                activate Database
+                group (Database)
+                    Database -> Repository : Refer 4.0
+                end
+                activate Schema
+                Repository -> Schema : variable error assign Errorlog(filename, functionname, error_message)
+                Schema --> Repository : variable error assigned Errorlog Instance
+                deactivate Schema
+                Repository -> Database : db_session.add(error)
+                note over Repository, Database
+                    **ORM OPERATION: INSERT ERRORLOG**
+                    db_session.add(error)
+                    db_session.commit()
+                    ' SQLAlchemy ORM handles INSERT automatically
+                end note
+                deactivate Database
+                Repository -> Repository : variable errorlog_id assign error.id
+                Repository --> Errorlog : error id is returned back to errorlog
+                deactivate Repository
+                Errorlog --> Tool : Flow goes back to the Tool layer
+                deactivate Errorlog
+            end
+
+           
+
+            group try(get_status)
+                Tool -> Tool : @tool decorator makes this function a tool for the agent
+                Tool -> Tool : For example if the user query is "tell me the status of order id XXXX", agent will automatically route to this tool
+                Tool -> Tool : In this tool function we access the repo to get the status of order in database
+                Tool -> Repository : variable status is assigned with repo.get_status function
+                activate Repository
+                Repository -> Database : Refer 4.0
+                activate Database
+                Database --> Repository : Refer 4.0
+                Repository -> Database : variable status assign db_session.query(Order.status) .filter(Order.order_id == order_id).first()
+                note over Repository, Database
+                    **ORM OPERATION: GET ORDER STATUS**
+                    db_session.query(Order.status)
+                    .filter(Order.order_id == order_id).first()
+                end note
+                Database --> Repository : db assigns status with current status of the order
+                deactivate Database
+                Repository --> Tool : status is returned back to tool for further process
+                deactivate Repository
+            end
+
+            group except(get_status)
+                Tool -> Errorlog : If any error occurs in get_status tool
+                activate Errorlog
+                Errorlog -> Errorlog : log_error function receives it and we access repo layer directly by creating instance of it here
+                Errorlog -> Errorlog : Payload is created using the parameter received
+                activate Repository
+                Errorlog -> Repository : variable response assigns log_error_in_db function by sending payload as parameter
+                Repository -> Repository : Before interacting with the database, a session must be created for communication.
+                Repository -> Repository : The session represents the active link between the Repository and the database.
+                Repository -> Database : variable db_session assign self.db_instance.SessionLocal() and we also invoke _create_engine() in database that returns database session.
+                activate Database
+                group (Database)
+                    Database -> Repository : Refer 4.0
+                end
+                activate Schema
+                Repository -> Schema : variable error assign Errorlog(filename, functionname, error_message)
+                Schema --> Repository : variable error assigned Errorlog Instance
+                deactivate Schema
+                Repository -> Database : db_session.add(error)
+                note over Repository, Database
+                    **ORM OPERATION: INSERT ERRORLOG**
+                    db_session.add(error)
+                    db_session.commit()
+                    ' SQLAlchemy ORM handles INSERT automatically
+                end note
+                deactivate Database
+                Repository -> Repository : variable errorlog_id assign error.id
+                Repository --> Errorlog : error id is returned back to errorlog
+                deactivate Repository
+                Errorlog --> Tool : Flow goes back to the Tool layer
+                deactivate Errorlog
+                
+            end
+
+            deactivate Tool
+        end
+
+        deactivate Router
+     end
+
+
+    deactivate Main
+end
+
+
+@enduml

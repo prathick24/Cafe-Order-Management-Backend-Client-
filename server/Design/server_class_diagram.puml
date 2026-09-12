@@ -1,0 +1,238 @@
+@startuml class_diagram
+skinparam classAttributeIconSize 0
+skinparam classFontSize 10
+skinparam packageStyle rectangle
+skinparam Linetype ortho
+ 
+ 
+package "Application Layer"{
+    class App <<src/main.py>>{
+        +app : FastAPI
+       
+    }
+ 
+}
+package "Routes Layer" {
+   class APIRouter <<src/routers/order_agent_router.py>>{
+       -agent_service: 
+       +chatbot_route(user_query): JSONResponse
+   }
+}
+ 
+
+package "Tools layer"{
+   class Tools <<src/tools/tool.py>>{
+        -repo : AgentRepository
+        +check_order_status(order_number)
+        +place_order(items, quantity)
+    }
+}
+package "Resource layer"{
+   class Resource <<src/resources/resource.py>>{
+        -repo : AgentRepository
+        +check_items(item_names)
+        +get_policy()
+    }
+}
+package "Prompt layer"{
+   class Prompt <<src/prompts/prompt.py>>{
+        +system_prompt()
+        +dish_making()
+    }
+}
+ 
+package "Repository layer"{
+   class AgentRepository <<src/repositories/order_agent_repositories.py>>{
+        -Database :Database
+        +check_items(item_names)
+        +check_order_status(order_number)
+        +place_order(items, quantity )
+    }
+    class Error_repo <<src/repositories/error_repo.py>>{
+        +insert_error_log(session: Session,file_name: str,function_name: str,error: str,err_code: Optional[str] = None,actor: str = "system", -> Dict[str, Any]:
+    }
+    class Database <<src/repositories/order_database.py>>{
+        +SessionLocal(): Session
+        +get_db(): Session
+    }
+}
+
+package schema {
+    class Menu <<src/repositories/schema/schema.py>>{
+        +item_id: int
+        +item_uuid : UUID
+        +item_name: str
+        +item_description: str
+        +price: float
+        +is_active : Bool
+        +created_at : datetime
+        +created_by : str
+        +updated_at :datetime
+        +updated_by :Str
+    }
+    class Order <<src/repositories/schema/schema.py>>{
+        +order_id: int
+        +order_uuid: UUID
+        +status: str
+        +total_price: float
+        +is_active : Bool
+        +created_at : datetime
+        +created_by : str
+        +updated_at :datetime
+        +updated_by :Str
+        
+    }
+
+    class Order_item <<src/repositories/schema/schema.py>>{
+        +order_item_id : int
+        +order_item_uuid : UUID
+        +item_id: int
+        +order_id:int
+        +quantity: int
+        +is_active : Bool
+        +created_at : datetime
+        +created_by : str
+        +updated_at :datetime
+        +updated_by :Str
+    }
+    class Error_logs <<src/repositories/schema/schema.py>>{
+        +error_log_id :int
+        +file_name :str
+        +function_name : str
+        +error :str
+        +error_code :str
+        +created_at : datetime
+        +created_by : str
+        +updated_at :datetime
+        +updated_by :Str       
+    }
+
+}
+
+ 
+ 
+' MODELS
+package "utils" {
+ 
+   
+   
+   class Error <<src/utils/exception/Error.py>>{
+       +code: str
+       +message: str
+       +error_code_id: Optional[str]
+       --
+       +to_dict(): dict
+   }
+   class CustomAppException <<src/utils/exception/custom_app_expection.py>>{
+       +message: str
+       +code: str
+       +status_code: int
+       +error_code_id: Optional[str]
+       +errors: List[Error]
+       +request_id: str
+       --
+       +to_api_response(): APIResponse
+       +from_errors(): CustomAppException
+   }
+    class Error_log <<src/utils/error_log.py>>{
+        +error_log(file_name,function_name,error):Dict
+    }
+    class ErrorCode <<src/models/error_codes.py>>{
+       +DATABASE_ERROR: str
+       +INTERNAL_SERVER_ERROR: str
+       +VALIDATION_ERROR: str
+   }
+   class ErrorCodeStatus <<src/models/error_codes.py>>{
+       +TRAINING_SQL_006: str
+       +TRAINING_SQL_005: str
+       +TRAINING_VAL_004: str
+   }
+   
+ 
+}
+ 
+ 
+ 
+ 
+package "models" {
+
+    class APIResponse <<src/utils/exception/api_response_dto.py>>{
+       +data: Optional[Any]
+       +errors: List[Error]
+       +code: int
+       +message: str
+       +request_id: str
+       --
+       +to_dict(): dict
+   }
+
+   
+   class UserQuery <<src/models/user_query_model.py>>{
+        +user_query:str
+   }
+}
+package "settings" {
+   class HttpStatusCode <<src/settings.py>>{
+       +OK: int
+       +CREATED: int
+       +BAD_REQUEST: int
+       +NOT_FOUND: int
+       +INTERNAL_SERVER_ERROR: int
+   }
+   class Config <<src/settings.py>>{
+        +get_config():dataclass
+    }
+}
+' === Relationships ===
+ 
+'Application -> Route
+App -> APIRouter : calls
+App <- APIRouter : retruns data
+' Route → Service
+
+
+APIRouter -> UserQuery:uses
+' Service -> Utils
+
+APIRouter -> Tools :uses
+APIRouter <- Tools :retruns data
+APIRouter -> Resource :uses
+APIRouter <- Prompt :uses
+APIRouter <- Prompt :retruns data
+
+Tools -> AgentRepository: uses
+Tools <- AgentRepository: returns data
+AgentRepository -> Database :uses
+
+AgentRepository -> schema :uses 
+
+Order -> Order_item :has relationship
+Menu ->Order_item :has relationship
+ 
+' Exception handling
+APIRouter ..> CustomAppException: raises
+
+
+ 
+CustomAppException --> ErrorCode : uses
+CustomAppException --> ErrorCodeStatus : uses
+
+APIResponse --> Error : uses
+APIResponse --> settings : uses
+models -> settings :uses
+
+
+ErrorCode --> APIResponse: uses
+
+Database --> Config :uses
+
+
+ 
+Error_log -> Error_repo :uses
+
+APIRouter  ..> Error_log : may raise
+
+AgentRepository ..> Error_log : may raise
+
+@enduml
+ 
